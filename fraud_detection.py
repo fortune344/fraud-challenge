@@ -481,74 +481,55 @@ def build_user_profiles(transactions):
 
 
 # --------------------------------------------------------------------------- #
-#  Détection de réseaux de fraude (graphe)                                     #
+#  Analyse géographique : « voyage impossible » détaillé                       #
 #                                                                             #
-#  Repère les fraudes COORDONNÉES : un même commerçant compromis qui touche    #
-#  plusieurs clients (anneau), des comptes liés par un point commun suspect.   #
+#  Pour chaque client, repère deux transactions dans des pays différents       #
+#  séparées par un temps trop court pour le trajet (distance réelle / vitesse  #
+#  d'un avion). Renvoie les détails chiffrés pour l'explicabilité.            #
 #  Fonction séparée : n'affecte pas `detect_fraud`.                            #
 # --------------------------------------------------------------------------- #
-def detect_fraud_networks(transactions):
-    """Construit le graphe clients <-> commerçants et détecte les anneaux.
+def geo_anomalies(transactions):
+    """Renvoie la liste des « voyages impossibles » avec leurs détails.
 
-    Renvoie {"nodes": [...], "edges": [...], "rings": [...]}.
-    Un anneau = un commerçant impliqué dans des transactions suspectes de
-    PLUSIEURS clients distincts (signature d'un point de compromission commun).
+    Chaque élément : user_id, from, to, distance_km, hours_elapsed,
+    hours_needed, tx_ids.
     """
     try:
         txs = list(transactions)
     except TypeError:
-        return {"nodes": [], "edges": [], "rings": []}
+        return []
 
     safe = [t if isinstance(t, dict) else {} for t in txs]
-    verdicts = detect_fraud(safe)
-    flagged_by_id = {v["transaction_id"]: v["is_suspicious"] for v in verdicts}
+    times = [_parse_time(t.get("timestamp")) for t in safe]
+    groups = _group_by_user(safe)
 
-    edges = {}            # (user, merchant) -> {"count", "flagged"}
-    merch_users = {}      # merchant -> set(users)
-    merch_flagged = {}    # merchant -> set(users ayant une tx suspecte ici)
-    users, merchants = set(), set()
-
-    for t in safe:
-        u = t.get("user_id")
-        m = t.get("merchant")
-        if not u or not m:
-            continue
-        users.add(u)
-        merchants.add(m)
-        flagged = bool(flagged_by_id.get(t.get("transaction_id")))
-        key = (u, m)
-        e = edges.setdefault(key, {"count": 0, "flagged": False})
-        e["count"] += 1
-        e["flagged"] = e["flagged"] or flagged
-        merch_users.setdefault(m, set()).add(u)
-        if flagged:
-            merch_flagged.setdefault(m, set()).add(u)
-
-    # Anneaux : commerçant compromis touchant >= 2 clients distincts.
-    rings = []
-    for m, fusers in merch_flagged.items():
-        if len(fusers) >= 2:
-            rings.append({
-                "merchant": m,
-                "users": sorted(fusers),
-                "n_users": len(fusers),
-            })
-    rings.sort(key=lambda r: r["n_users"], reverse=True)
-    ring_merchants = {r["merchant"] for r in rings}
-
-    flagged_users = {u for (u, m), e in edges.items() if e["flagged"]}
-
-    nodes = []
-    for u in sorted(users):
-        nodes.append({"id": u, "type": "user", "flagged": u in flagged_users})
-    for m in sorted(merchants):
-        nodes.append({"id": m, "type": "merchant",
-                      "flagged": m in merch_flagged, "ring": m in ring_merchants})
-
-    edge_list = [{"user": u, "merchant": m, "count": e["count"],
-                  "flagged": e["flagged"]} for (u, m), e in edges.items()]
-
-    return {"nodes": nodes, "edges": edge_list, "rings": rings}
+    out = []
+    for uid, idxs in groups.items():
+        timed = [i for i in idxs if times[i] is not None and safe[i].get("country")]
+        timed.sort(key=lambda i: times[i])
+        for a, b in zip(timed, timed[1:]):
+            ca, cb = safe[a].get("country"), safe[b].get("country")
+            if not ca or not cb or ca == cb:
+                continue
+            ka = _COUNTRY_COORDS.get(ca.upper())
+            kb = _COUNTRY_COORDS.get(cb.upper())
+            if not ka or not kb:
+                continue
+            gap_h = _hours_between(times[a], times[b])
+            dist = _haversine_km(ka, kb)
+            needed = dist / MAX_TRAVEL_SPEED_KMH
+            if gap_h < needed * TRAVEL_TIME_BUFFER:
+                out.append({
+                    "user_id": uid,
+                    "from": ca,
+                    "to": cb,
+                    "distance_km": round(dist),
+                    "hours_elapsed": round(gap_h, 2),
+                    "hours_needed": round(needed, 1),
+                    "tx_ids": [safe[a].get("transaction_id"),
+                               safe[b].get("transaction_id")],
+                })
+    return out
 
 
 # --------------------------------------------------------------------------- #

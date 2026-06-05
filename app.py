@@ -6,8 +6,8 @@ Interface NÉO-BRUTALISTE : fond crème texturé, bordures noires, ombres dures,
 typographie géante, accent jaune acide. Volontairement aux antipodes du
 « dashboard sombre » générique.
 
-Fonctionnalités : scoring (detect_fraud), profils comportementaux, détection
-de réseaux de fraude (graphe), prédiction de propension par client, et
+Fonctionnalités : scoring (detect_fraud), profils comportementaux, analyse
+géographique (voyage impossible), prédiction de propension par client, et
 génération d'un rapport téléchargeable.
 
 Lancement :  streamlit run app.py
@@ -15,6 +15,7 @@ Lancement :  streamlit run app.py
 
 import csv
 import io
+import os
 from datetime import date
 
 import altair as alt
@@ -22,8 +23,12 @@ import pandas as pd
 import streamlit as st
 
 from fraud_detection import (_clean_row, build_user_profiles,
-                             detect_fraud, detect_fraud_networks,
-                             forecast_client_risk)
+                             detect_fraud, forecast_client_risk,
+                             geo_anomalies, load_transactions)
+
+# CSV de démonstration : le fichier officiel du dépôt (data/sample_transactions.csv).
+_DATA_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "data", "sample_transactions.csv")
 
 
 # --------------------------------------------------------------------------- #
@@ -40,24 +45,6 @@ RISK_ORDER = ["Critique", "Élevé", "Moyen", "Faible"]
 RISK_COLOR = {"Critique": CRIT_C, "Élevé": HIGH_C, "Moyen": MED_C, "Faible": LOW_C}
 CHIP_TXT = {CRIT_C: "#fff", HIGH_C: "#fff", MED_C: INK, LOW_C: INK}
 PROP_COLOR = {"Forte": CRIT_C, "Modérée": HIGH_C, "Faible": LOW_C}
-
-# Jeu d'exemple : les 10 transactions officielles + un anneau de fraude
-# (commerçant compromis « GhostPay » touchant 3 comptes) pour la démo réseau.
-_EXEMPLE_CSV = """transaction_id,timestamp,user_id,amount,currency,merchant,country,card_present
-T-001,2025-05-02T09:15:00Z,U1,48.00,EUR,Boulangerie,FR,true
-T-002,2025-05-09T12:40:00Z,U1,52.50,EUR,Supermarche,FR,true
-T-003,2025-05-15T19:05:00Z,U1,47.20,EUR,Restaurant,FR,true
-T-004,2025-06-01T03:22:00Z,U1,4800.00,EUR,Bijouterie,FR,false
-T-010,2025-06-01T10:00:00Z,U2,60.00,EUR,Cafe,FR,true
-T-011,2025-06-01T10:40:00Z,U2,75.00,JPY,Konbini,JP,false
-T-020,2025-06-02T14:00:00Z,U3,-30.00,EUR,Remboursement?,FR,true
-T-021,2025-06-02T15:00:00Z,U3,40.00,EUR,Kiosque,,true
-T-030,2025-06-03T08:00:00Z,U4,90.00,EUR,Hotel,FR,true
-T-031,2025-06-06T08:00:00Z,U4,120.00,USD,Hotel,US,false
-T-040,2025-06-04T02:10:00Z,U5,0.00,EUR,GhostPay,FR,false
-T-041,2025-06-04T02:30:00Z,U6,-15.00,EUR,GhostPay,FR,false
-T-042,2025-06-04T02:45:00Z,U7,500.00,EUR,GhostPay,,false
-"""
 
 
 # --------------------------------------------------------------------------- #
@@ -233,6 +220,15 @@ CSS = """
                text-transform:uppercase; letter-spacing:.5px; }
   .nb-exp .b { font-weight:500; font-size:14px; margin-top:3px; }
 
+  /* Géo */
+  .nb-geo { display:flex; align-items:center; gap:16px; padding:14px 16px;
+            border-bottom:3px solid #111; }
+  .nb-geo:last-child { border-bottom:none; }
+  .nb-geo-route { font-family:'Archivo Black',sans-serif; font-size:22px;
+                  min-width:120px; letter-spacing:-.5px; }
+  .nb-geo-meta { flex:1; font-size:13px; line-height:1.5; }
+  .nb-geo-meta .k { font-family:'Space Mono',monospace; font-weight:700; }
+
   /* Prédiction */
   .nb-pred { padding:14px 16px; border-bottom:3px solid #111; }
   .nb-pred:last-child { border-bottom:none; }
@@ -321,62 +317,27 @@ def _risk_rows(view):
     return f'<div class="nb-card">{"".join(out)}</div>'
 
 
-def _network_svg(net):
-    """Graphe bipartite clients <-> commerçants ; rouge = suspect, anneaux mis en avant."""
-    users = [n for n in net["nodes"] if n["type"] == "user"]
-    merch = [n for n in net["nodes"] if n["type"] == "merchant"]
-    if not users or not merch:
-        return '<div class="nb-card"><div class="nb-row"><div class="nb-reason">' \
-               'Pas assez de données pour le graphe.</div></div></div>'
-
-    W, rowH, padY = 640, 36, 34
-    H = max(len(users), len(merch)) * rowH + padY
-    xu, xm = 130, W - 130
-
-    def ys(items):
-        if len(items) == 1:
-            return {items[0]["id"]: H / 2}
-        step = (H - padY) / (len(items) - 1)
-        return {it["id"]: padY / 2 + i * step for i, it in enumerate(items)}
-
-    yu, ym = ys(users), ys(merch)
-
-    svg = [f'<svg viewBox="0 0 {W} {H}" width="100%" style="display:block">']
-    # Arêtes
-    for e in net["edges"]:
-        if e["user"] not in yu or e["merchant"] not in ym:
-            continue
-        x1, y1, x2, y2 = xu, yu[e["user"]], xm, ym[e["merchant"]]
-        if e["flagged"]:
-            svg.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" '
-                       f'stroke="{CRIT_C}" stroke-width="3"/>')
-        else:
-            svg.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" '
-                       f'stroke="#111" stroke-width="1.2" opacity="0.3"/>')
-    # Noeuds clients
-    for n in users:
-        y = yu[n["id"]]
-        fill = CRIT_C if n["flagged"] else "#111"
-        svg.append(f'<rect x="{xu - 9}" y="{y - 9}" width="18" height="18" '
-                   f'fill="{fill}" stroke="#111" stroke-width="2"/>')
-        svg.append(f'<text x="{xu - 16}" y="{y + 4}" text-anchor="end" '
-                   f'font-family="Space Mono" font-weight="700" font-size="13" '
-                   f'fill="#111">{n["id"]}</text>')
-    # Noeuds commerçants
-    for n in merch:
-        y = ym[n["id"]]
-        ring = n.get("ring")
-        fill = CRIT_C if ring else (HIGH_C if n["flagged"] else "#fff")
-        sw = 3 if ring else 2
-        svg.append(f'<rect x="{xm - 9}" y="{y - 9}" width="18" height="18" '
-                   f'fill="{fill}" stroke="#111" stroke-width="{sw}"/>')
-        label = (n["id"][:16])
-        weight = "700" if ring else "600"
-        svg.append(f'<text x="{xm + 16}" y="{y + 4}" text-anchor="start" '
-                   f'font-family="Space Grotesk" font-weight="{weight}" font-size="13" '
-                   f'fill="#111">{label}{" ⚠" if ring else ""}</text>')
-    svg.append("</svg>")
-    return f'<div class="nb-card" style="padding:14px 16px">{"".join(svg)}</div>'
+def _geo_rows(anomalies):
+    """Cartes détaillées des voyages impossibles (distance, temps)."""
+    if not anomalies:
+        return ('<div class="nb-card"><div class="nb-row"><div class="nb-reason">'
+                'Aucun voyage impossible détecté sur ce lot.</div></div></div>')
+    out = []
+    for a in anomalies:
+        elapsed = a["hours_elapsed"]
+        el_txt = (f'{int(elapsed*60)} min' if elapsed < 1 else f'{elapsed:.1f} h')
+        out.append(
+            f'<div class="nb-geo">'
+            f'<div class="nb-geo-route">{a["from"]} <span style="color:{CRIT_C}">→</span> {a["to"]}</div>'
+            f'<div class="nb-geo-meta">'
+            f'<b>{a["user_id"]}</b> · {a["tx_ids"][0]} → {a["tx_ids"][1]}<br>'
+            f'<span class="k">{_fmt(a["distance_km"])} km</span> à parcourir · '
+            f'<span class="k">{a["hours_needed"]:.1f} h</span> nécessaires en avion · '
+            f'seulement <span class="k" style="color:{CRIT_C}">{el_txt}</span> écoulées'
+            f'</div>'
+            f'<div class="nb-chip" style="background:{CRIT_C};color:#fff">IMPOSSIBLE</div>'
+            f'</div>')
+    return f'<div class="nb-card">{"".join(out)}</div>'
 
 
 def _forecast_rows(forecast):
@@ -401,7 +362,7 @@ def _forecast_rows(forecast):
 # --------------------------------------------------------------------------- #
 #  Rapport                                                                     #
 # --------------------------------------------------------------------------- #
-def _build_report_md(df, alerts, net, forecast, profiles, currency_ref):
+def _build_report_md(df, alerts, geo, forecast, profiles, currency_ref):
     total = len(df)
     flagged = len(alerts)
     taux = (flagged / total * 100) if total else 0
@@ -413,7 +374,7 @@ def _build_report_md(df, alerts, net, forecast, profiles, currency_ref):
     L.append(f"- Transactions analysées : **{total}**")
     L.append(f"- Transactions suspectes : **{flagged}** (taux {taux:.0f} %)")
     L.append(f"- Montant sous surveillance : **{_fmt(montant)} {currency_ref}**")
-    L.append(f"- Réseaux de fraude détectés : **{len(net['rings'])}**\n")
+    L.append(f"- Voyages impossibles détectés : **{len(geo)}**\n")
     L.append("## 2. Alertes détaillées")
     if flagged:
         for _, r in alerts.iterrows():
@@ -421,21 +382,24 @@ def _build_report_md(df, alerts, net, forecast, profiles, currency_ref):
                      f"score {r['fraud_score']:.2f} — {_enriched_explanation(r, profiles.get(r['user_id']))}")
     else:
         L.append("- Aucune alerte.")
-    L.append("\n## 3. Réseaux de fraude")
-    if net["rings"]:
-        for ring in net["rings"]:
-            L.append(f"- Commerçant compromis **{ring['merchant']}** — {ring['n_users']} "
-                     f"comptes liés : {', '.join(ring['users'])}")
+    L.append("\n## 3. Voyages impossibles")
+    if geo:
+        for a in geo:
+            el = a["hours_elapsed"]
+            el_txt = f"{int(el*60)} min" if el < 1 else f"{el:.1f} h"
+            L.append(f"- **{a['user_id']}** : {a['from']} → {a['to']} — {_fmt(a['distance_km'])} km, "
+                     f"{a['hours_needed']:.1f} h nécessaires, {el_txt} écoulées "
+                     f"({a['tx_ids'][0]} → {a['tx_ids'][1]})")
     else:
-        L.append("- Aucun anneau détecté sur ce lot.")
+        L.append("- Aucun voyage impossible détecté sur ce lot.")
     L.append("\n## 4. Prédiction — propension de fraude par client")
     for uid in sorted(forecast, key=lambda u: forecast[u]["score"], reverse=True):
         f = forecast[uid]
         drv = ", ".join(name for name, _ in f["drivers"][:3]) or "—"
         L.append(f"- **{uid}** : propension {f['level']} ({int(f['score']*100)} %) — facteurs : {drv}")
     L.append("\n## 5. Recommandations")
-    if net["rings"]:
-        L.append("- Bloquer et enquêter en priorité sur les commerçants compromis identifiés.")
+    if geo:
+        L.append("- Bloquer immédiatement les comptes présentant un voyage impossible (carte clonée probable).")
     if taux >= 30:
         L.append("- Taux d'alertes élevé : renforcer les contrôles (authentification forte).")
     forts = [u for u in forecast if forecast[u]["level"] == "Forte"]
@@ -492,7 +456,11 @@ def render_interface():
                 except Exception:
                     st.error("CSV invalide.")
         else:
-            transactions = _rows_from_csv_text(_EXEMPLE_CSV)
+            try:
+                transactions = load_transactions(_DATA_CSV)
+                st.caption(f"Source : data/sample_transactions.csv ({len(transactions)} transactions)")
+            except Exception:
+                st.error("Fichier data/sample_transactions.csv introuvable.")
         st.caption("Colonnes : transaction_id, timestamp, user_id, amount, "
                    "currency, merchant, country, card_present.")
 
@@ -503,7 +471,7 @@ def render_interface():
     results = detect_fraud(transactions)
     df = _build_dataframe(transactions, results)
     profiles = build_user_profiles(transactions)
-    net = detect_fraud_networks(transactions)
+    geo = geo_anomalies(transactions)
     forecast = forecast_client_risk(transactions)
 
     with st.sidebar:
@@ -540,7 +508,7 @@ def render_interface():
     st.markdown(
         f'<div class="nb-hero"><div>'
         f'<div class="nb-title">ANTI-<span class="hl">FRAUDE.</span></div>'
-        f'<div class="nb-sub">Détecteur · Profil comportemental · Réseaux · Prédiction · LBS 2026</div>'
+        f'<div class="nb-sub">Détecteur · Profil comportemental · Géo · Prédiction · LBS 2026</div>'
         f'</div><div class="nb-right">'
         f'<div class="nb-stamp" style="color:{stamp_col};border-color:{stamp_col}">{stamp_html}</div>'
         f'<div class="nb-menace"><div class="n"><span class="cu-menace"></span></div>'
@@ -580,19 +548,11 @@ def render_interface():
                 f'<div class="b">{_enriched_explanation(r, profiles.get(r["user_id"]))}</div></div>')
         st.markdown(f'<div class="nb-card">{"".join(items)}</div>', unsafe_allow_html=True)
 
-    # Réseaux de fraude
-    st.markdown('<div class="nb-sec">Réseaux de fraude</div>', unsafe_allow_html=True)
-    if net["rings"]:
-        rs = " · ".join(f'{r["merchant"]} ({r["n_users"]} comptes)' for r in net["rings"])
-        st.markdown(f'<div class="nb-sub" style="margin:0 0 10px;opacity:1;color:{CRIT_C}">'
-                    f'⚠ Anneau(x) détecté(s) : {rs}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="nb-sub" style="margin:0 0 10px">Aucun anneau sur ce lot '
-                    '— la détection s\'active dès qu\'un commerçant touche plusieurs comptes.'
-                    '</div>', unsafe_allow_html=True)
-    st.markdown(_network_svg(net), unsafe_allow_html=True)
-    st.caption("■ noir = client · ⬜ commerçant · rouge = impliqué dans une fraude · "
-               "⚠ = commerçant compromis (anneau). Trait rouge = lien suspect.")
+    # Analyse géographique — voyage impossible
+    st.markdown('<div class="nb-sec">Voyage impossible</div>', unsafe_allow_html=True)
+    st.markdown(_geo_rows(geo), unsafe_allow_html=True)
+    st.caption("Cohérence géographique : distance réelle (haversine) rapportée au "
+               "temps écoulé. Un trajet plus rapide qu'un avion = physiquement impossible.")
 
     # Prédiction
     st.markdown('<div class="nb-sec">Prédiction · propension par client</div>',
@@ -631,7 +591,7 @@ def render_interface():
 
     # Rapport
     st.markdown('<div class="nb-sec">Rapport</div>', unsafe_allow_html=True)
-    report_md = _build_report_md(df, alerts, net, forecast, profiles, currency_ref)
+    report_md = _build_report_md(df, alerts, geo, forecast, profiles, currency_ref)
     report_html = _build_report_html(report_md)
     rc1, rc2 = st.columns(2)
     rc1.download_button("⬇ Rapport (HTML imprimable)", data=report_html.encode("utf-8"),
