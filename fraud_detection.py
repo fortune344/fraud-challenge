@@ -1,13 +1,40 @@
+# -*- coding: utf-8 -*-
 """
-Défi — Détection de fraude financière.
+Détecteur de fraude — Hackathon IT 2026 (Lomé Business School).
 
-Vous devez implémenter la fonction `detect_fraud`.
-La fonction `load_transactions` vous est FOURNIE (ne la modifiez pas).
+Architecture en couches, du plus simple au plus fin :
+
+  Niveau 1 — Robustesse & anomalies évidentes
+      • ne plante jamais (champs vides, doublons, horodatages désordonnés)
+      • montant nul ou négatif
+      • champ obligatoire manquant
+
+  Niveau 2 — Logique métier (chaque transaction est comparée à
+             l'HISTORIQUE du même client)
+      • montant très supérieur à l'habitude du client (statistique robuste)
+      • « voyage impossible » : deux pays incompatibles avec le temps écoulé,
+        évalué par distance géographique réelle (haversine) — et non par une
+        simple égalité de pays, ce qui évite de pénaliser un trajet plausible
+      • fréquence de transactions anormale (rafale)
+      • transaction en double (double débit)
+
+  Niveau 3 — Finesse / anti-faux-positifs
+      • un écart léger ne déclenche jamais d'alerte (seuils calibrés)
+      • toute la logique est calculée, jamais codée en dur
+
+Seule la fonction `detect_fraud` est notée. `load_transactions` est fournie.
 """
+
+from __future__ import annotations
 
 import csv
+import math
+from datetime import datetime
 
 
+# --------------------------------------------------------------------------- #
+#  Lecture du CSV (fournie par les organisateurs — ne pas perdre de temps ici) #
+# --------------------------------------------------------------------------- #
 def load_transactions(path):
     """Lit un fichier CSV de transactions et renvoie une liste de dicts."""
     transactions = []
@@ -47,10 +74,351 @@ def _clean_row(row):
     }
 
 
+# --------------------------------------------------------------------------- #
+#  Paramètres de détection (regroupés ici pour la lisibilité et le réglage)    #
+# --------------------------------------------------------------------------- #
+
+# Champs sans lesquels une transaction ne peut pas être correctement évaluée.
+# (le timestamp est traité à part : il sert au tri et peut être absent)
+REQUIRED_FIELDS = ("transaction_id", "user_id", "amount",
+                   "currency", "merchant", "country")
+
+# Montant : on ne juge un écart que si l'on dispose d'un historique suffisant.
+MIN_HISTORY_FOR_AMOUNT = 3      # nb minimum de montants passés pour comparer
+AMOUNT_HIGH_MULTIPLIER = 4.0    # « très supérieur » = au-delà de 4× la médiane
+AMOUNT_ABSOLUTE_FLOOR = 50.0    # garde-fou : ignore les écarts en valeur absolue faible
+AMOUNT_Z_THRESHOLD = 3.5        # finesse N3 : l'écart doit aussi être un outlier
+                                # statistique vis-à-vis de la VARIABILITÉ du client
+                                # (un client volatil tolère de plus gros montants)
+
+# Voyage impossible : vitesse de déplacement maximale réaliste (avion direct).
+MAX_TRAVEL_SPEED_KMH = 900.0
+TRAVEL_TIME_BUFFER = 0.85       # marge : on alerte si le temps écoulé est < 85 %
+                                # du temps minimal nécessaire au trajet
+UNKNOWN_COUNTRY_MAX_GAP_H = 1.0  # pays inconnu du référentiel : alerte si < 1 h
+
+# Fréquence : rafale de transactions sur une fenêtre très courte.
+FREQ_WINDOW_MINUTES = 5
+FREQ_MAX_IN_WINDOW = 3          # 3+ transactions en 5 min = anormal
+
+# Double débit : transactions identiques très rapprochées.
+DUPLICATE_WINDOW_MINUTES = 2
+
+# Paiement sans carte d'un montant inhabituel (mais sous le seuil « très élevé »).
+CARD_ABSENT_MULTIPLIER = 3.0
+
+# Seuil de bascule score -> alerte.
+SUSPICION_THRESHOLD = 0.5
+
+# Scores attribués par catégorie (cohérents avec la gravité du signal).
+SCORE_NON_POSITIVE = 0.9
+SCORE_MISSING = 0.85
+SCORE_AMOUNT_HIGH = 0.9
+SCORE_IMPOSSIBLE_TRAVEL = 0.88
+SCORE_DUPLICATE = 0.7
+SCORE_FREQUENCY = 0.7
+SCORE_CARD_ABSENT = 0.6
+SCORE_CLEAN = 0.0
+
+
+# Centroïdes approximatifs (lat, lon) pour estimer les distances entre pays.
+# Couvre la zone EUR / USD / XOF du sujet ; extensible sans risque.
+_COUNTRY_COORDS = {
+    "FR": (46.6, 2.2), "BE": (50.5, 4.5), "DE": (51.2, 10.4), "ES": (40.0, -3.7),
+    "IT": (41.9, 12.6), "PT": (39.4, -8.2), "NL": (52.1, 5.3), "CH": (46.8, 8.2),
+    "GB": (54.0, -2.0), "UK": (54.0, -2.0), "IE": (53.4, -8.2), "LU": (49.8, 6.1),
+    "US": (39.8, -98.6), "CA": (56.1, -106.3), "MX": (23.6, -102.5),
+    "BR": (-14.2, -51.9), "AR": (-38.4, -63.6),
+    "JP": (36.2, 138.3), "CN": (35.9, 104.2), "IN": (20.6, 79.0),
+    "KR": (35.9, 127.8), "TH": (15.9, 100.9), "SG": (1.35, 103.8),
+    "AE": (23.4, 53.8), "SA": (23.9, 45.1), "TR": (39.0, 35.2),
+    "RU": (61.5, 105.3), "AU": (-25.3, 133.8), "ZA": (-30.6, 22.9),
+    # Afrique de l'Ouest (zone XOF) :
+    "TG": (8.6, 0.8), "BJ": (9.3, 2.3), "CI": (7.5, -5.5), "SN": (14.5, -14.5),
+    "ML": (17.6, -4.0), "BF": (12.2, -1.6), "NE": (17.6, 8.1), "GW": (11.8, -15.2),
+    "GH": (7.9, -1.0), "NG": (9.1, 8.7), "CM": (7.4, 12.4), "MA": (31.8, -7.1),
+    "DZ": (28.0, 1.7), "TN": (33.9, 9.5), "EG": (26.8, 30.8),
+}
+
+
+# --------------------------------------------------------------------------- #
+#  Petits utilitaires sûrs (ne lèvent jamais d'exception)                      #
+# --------------------------------------------------------------------------- #
+def _parse_time(value):
+    """Convertit un horodatage ISO 8601 en datetime ; None si impossible."""
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        # Dernier recours : quelques formats courants.
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value.strip()[:19], fmt)
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def _median(values):
+    """Médiane d'une liste de nombres (robuste aux valeurs aberrantes)."""
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return None
+    mid = n // 2
+    if n % 2:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def _haversine_km(c1, c2):
+    """Distance en km entre deux couples (lat, lon)."""
+    lat1, lon1 = c1
+    lat2, lon2 = c2
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = (math.sin(dphi / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2)
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _hours_between(t1, t2):
+    """Écart en heures (positif) entre deux datetimes."""
+    return abs((t2 - t1).total_seconds()) / 3600.0
+
+
+def _is_impossible_travel(country_a, time_a, country_b, time_b):
+    """
+    Renvoie True si passer de country_a à country_b dans l'intervalle donné
+    est physiquement impossible (déplacement plus rapide qu'un avion direct).
+    """
+    if country_a == country_b:
+        return False
+    gap_h = _hours_between(time_a, time_b)
+
+    ca = _COUNTRY_COORDS.get(country_a.upper() if country_a else None)
+    cb = _COUNTRY_COORDS.get(country_b.upper() if country_b else None)
+    if ca is None or cb is None:
+        # Référentiel incomplet : on reste prudent (peu d'alertes).
+        return gap_h < UNKNOWN_COUNTRY_MAX_GAP_H
+
+    distance = _haversine_km(ca, cb)
+    travel_needed_h = distance / MAX_TRAVEL_SPEED_KMH
+    return gap_h < travel_needed_h * TRAVEL_TIME_BUFFER
+
+
+# --------------------------------------------------------------------------- #
+#  Analyses contextuelles : on pré-calcule les index suspects par client       #
+# --------------------------------------------------------------------------- #
+def _group_by_user(transactions):
+    """Regroupe les indices de transactions par user_id."""
+    groups = {}
+    for i, tx in enumerate(transactions):
+        uid = tx.get("user_id")
+        groups.setdefault(uid, []).append(i)
+    return groups
+
+
+def _flag_impossible_travel(transactions, groups, times):
+    """Indices des transactions impliquées dans un saut géographique impossible."""
+    flagged = set()
+    for indices in groups.values():
+        # On ordonne les transactions du client dans le temps.
+        timed = [i for i in indices if times[i] is not None
+                 and transactions[i].get("country")]
+        timed.sort(key=lambda i: times[i])
+        for a, b in zip(timed, timed[1:]):
+            ca, cb = transactions[a].get("country"), transactions[b].get("country")
+            if _is_impossible_travel(ca, times[a], cb, times[b]):
+                flagged.add(a)
+                flagged.add(b)
+    return flagged
+
+
+def _flag_frequency(transactions, groups, times):
+    """Indices appartenant à une rafale (>= N transactions en peu de temps)."""
+    flagged = set()
+    window = FREQ_WINDOW_MINUTES * 60.0
+    for indices in groups.values():
+        timed = sorted((i for i in indices if times[i] is not None),
+                       key=lambda i: times[i])
+        # Fenêtre glissante : pour chaque départ, combien tiennent dans la fenêtre.
+        start = 0
+        for end in range(len(timed)):
+            while (times[timed[end]] - times[timed[start]]).total_seconds() > window:
+                start += 1
+            if end - start + 1 >= FREQ_MAX_IN_WINDOW:
+                for k in range(start, end + 1):
+                    flagged.add(timed[k])
+    return flagged
+
+
+def _flag_duplicates(transactions, groups, times):
+    """Indices de débits quasi-identiques très rapprochés (double débit)."""
+    flagged = set()
+    window = DUPLICATE_WINDOW_MINUTES * 60.0
+    for indices in groups.values():
+        timed = sorted((i for i in indices if times[i] is not None),
+                       key=lambda i: times[i])
+        for a, b in zip(timed, timed[1:]):
+            ta, tb = transactions[a], transactions[b]
+            same = (ta.get("amount") is not None
+                    and ta.get("amount") == tb.get("amount")
+                    and ta.get("merchant") == tb.get("merchant")
+                    and ta.get("country") == tb.get("country"))
+            close = (times[b] - times[a]).total_seconds() <= window
+            if same and close:
+                flagged.add(a)
+                flagged.add(b)
+    return flagged
+
+
+def _user_amount_history(transactions, groups):
+    """Pour chaque transaction, la liste des montants POSITIFS des AUTRES
+    transactions du même client (sa dépense « habituelle »)."""
+    history = {}
+    for indices in groups.values():
+        positives = [(i, transactions[i].get("amount")) for i in indices
+                     if isinstance(transactions[i].get("amount"), (int, float))
+                     and transactions[i].get("amount") > 0]
+        for i in indices:
+            others = [amt for (j, amt) in positives if j != i]
+            history[i] = others
+    return history
+
+
+# --------------------------------------------------------------------------- #
+#  Fonction principale                                                         #
+# --------------------------------------------------------------------------- #
 def detect_fraud(transactions):
     """Analyse une liste de transactions et renvoie un verdict pour chacune.
 
     Retour : list[dict] avec transaction_id, fraud_score (0-1),
-    is_suspicious (bool), reason (str) — un résultat par transaction, même ordre.
+    is_suspicious (bool), reason (str) — un résultat par transaction,
+    dans le même ordre.
     """
-    raise NotImplementedError("Implémentez detect_fraud")
+    # Garde-fou : l'entrée doit être itérable ; sinon on renvoie une liste vide.
+    try:
+        transactions = list(transactions)
+    except TypeError:
+        return []
+
+    # Pré-calculs contextuels (robustes : tout champ douteux est neutralisé).
+    times = [_parse_time(tx.get("timestamp")) if isinstance(tx, dict) else None
+             for tx in transactions]
+    groups = _group_by_user(
+        [tx if isinstance(tx, dict) else {} for tx in transactions])
+
+    safe_tx = [tx if isinstance(tx, dict) else {} for tx in transactions]
+    travel_flags = _flag_impossible_travel(safe_tx, groups, times)
+    freq_flags = _flag_frequency(safe_tx, groups, times)
+    dup_flags = _flag_duplicates(safe_tx, groups, times)
+    amount_history = _user_amount_history(safe_tx, groups)
+
+    results = []
+    for i, tx in enumerate(transactions):
+        try:
+            results.append(
+                _evaluate_one(i, tx, travel_flags, freq_flags,
+                              dup_flags, amount_history))
+        except Exception:
+            # Aucune transaction ne doit faire planter le lot.
+            tid = tx.get("transaction_id") if isinstance(tx, dict) else None
+            results.append({
+                "transaction_id": tid,
+                "fraud_score": 0.0,
+                "is_suspicious": False,
+                "reason": "Transaction non analysable (données illisibles)",
+            })
+    return results
+
+
+def _is_amount_anomaly(amount, hist):
+    """Détecte un montant VRAIMENT anormal pour CE client (anti-faux-positifs).
+
+    Double condition, pour ne jamais crier au loup sur un simple écart :
+      1) Relative — le montant dépasse nettement l'habitude (> 4× la médiane)
+         avec un garde-fou en valeur absolue ;
+      2) Statistique robuste — le montant est un outlier au regard de la PROPRE
+         variabilité du client (z-score modifié basé sur la MAD). Un client qui
+         dépense 10k–18k ne sera donc pas alerté pour 25k ; un client qui dépense
+         toujours 50 le sera pour 250.
+    """
+    if not (isinstance(amount, (int, float)) and len(hist) >= MIN_HISTORY_FOR_AMOUNT):
+        return False
+    med = _median(hist)
+    if not med or amount <= med:
+        return False
+    # 1) Garde relatif + absolu
+    if amount <= med * AMOUNT_HIGH_MULTIPLIER or amount - med <= AMOUNT_ABSOLUTE_FLOOR:
+        return False
+    # 2) Garde statistique : outlier vs la variabilité du client
+    mad = _median([abs(x - med) for x in hist])
+    if mad == 0:
+        return True  # client parfaitement régulier : l'écart marqué est suspect
+    z = 0.6745 * (amount - med) / mad
+    return z >= AMOUNT_Z_THRESHOLD
+
+
+def _evaluate_one(i, tx, travel_flags, freq_flags, dup_flags, amount_history):
+    """Applique les règles par ordre de priorité ; renvoie un verdict unique."""
+    if not isinstance(tx, dict):
+        tx = {}
+
+    tid = tx.get("transaction_id")
+    amount = tx.get("amount")
+
+    def verdict(score, reason):
+        return {
+            "transaction_id": tid,
+            "fraud_score": round(float(score), 4),
+            "is_suspicious": bool(score >= SUSPICION_THRESHOLD),
+            "reason": reason,
+        }
+
+    # --- Niveau 1 : anomalies évidentes ------------------------------------ #
+    # 1) Montant nul ou négatif (le montant existe mais est invalide).
+    if isinstance(amount, (int, float)) and amount <= 0:
+        return verdict(SCORE_NON_POSITIVE, "Montant nul ou négatif")
+
+    # 2) Champs obligatoires manquants.
+    missing = [f for f in REQUIRED_FIELDS if tx.get(f) in (None, "")]
+    if missing:
+        return verdict(SCORE_MISSING,
+                       "Champs obligatoires manquants: " + ", ".join(missing))
+
+    # --- Niveau 2 : logique métier ----------------------------------------- #
+    # 3) Montant très supérieur à l'habitude du client (et outlier statistique).
+    hist = amount_history.get(i, [])
+    if _is_amount_anomaly(amount, hist):
+        return verdict(SCORE_AMOUNT_HIGH,
+                       "Montant très supérieur à l'habitude du client")
+
+    # 4) Deux pays différents en trop peu de temps (voyage impossible).
+    if i in travel_flags:
+        return verdict(SCORE_IMPOSSIBLE_TRAVEL,
+                       "Deux pays différents en trop peu de temps")
+
+    # 5) Transaction en double (double débit).
+    if i in dup_flags:
+        return verdict(SCORE_DUPLICATE, "Transaction en double suspectée")
+
+    # 6) Fréquence de transactions anormale.
+    if i in freq_flags:
+        return verdict(SCORE_FREQUENCY, "Fréquence de transactions anormale")
+
+    # 7) Paiement sans carte d'un montant inhabituel (signal plus faible).
+    if (tx.get("card_present") is False
+            and isinstance(amount, (int, float))
+            and len(hist) >= MIN_HISTORY_FOR_AMOUNT):
+        med = _median(hist)
+        if med and amount > med * CARD_ABSENT_MULTIPLIER:
+            return verdict(SCORE_CARD_ABSENT,
+                           "Paiement sans carte pour un montant inhabituel")
+
+    # --- Niveau 3 : rien d'anormal ----------------------------------------- #
+    return verdict(SCORE_CLEAN, "Transaction conforme au profil du client")
