@@ -478,3 +478,150 @@ def build_user_profiles(transactions):
             "median_interval_h": round(_median(intervals), 1) if intervals else None,
         }
     return profiles
+
+
+# --------------------------------------------------------------------------- #
+#  Détection de réseaux de fraude (graphe)                                     #
+#                                                                             #
+#  Repère les fraudes COORDONNÉES : un même commerçant compromis qui touche    #
+#  plusieurs clients (anneau), des comptes liés par un point commun suspect.   #
+#  Fonction séparée : n'affecte pas `detect_fraud`.                            #
+# --------------------------------------------------------------------------- #
+def detect_fraud_networks(transactions):
+    """Construit le graphe clients <-> commerçants et détecte les anneaux.
+
+    Renvoie {"nodes": [...], "edges": [...], "rings": [...]}.
+    Un anneau = un commerçant impliqué dans des transactions suspectes de
+    PLUSIEURS clients distincts (signature d'un point de compromission commun).
+    """
+    try:
+        txs = list(transactions)
+    except TypeError:
+        return {"nodes": [], "edges": [], "rings": []}
+
+    safe = [t if isinstance(t, dict) else {} for t in txs]
+    verdicts = detect_fraud(safe)
+    flagged_by_id = {v["transaction_id"]: v["is_suspicious"] for v in verdicts}
+
+    edges = {}            # (user, merchant) -> {"count", "flagged"}
+    merch_users = {}      # merchant -> set(users)
+    merch_flagged = {}    # merchant -> set(users ayant une tx suspecte ici)
+    users, merchants = set(), set()
+
+    for t in safe:
+        u = t.get("user_id")
+        m = t.get("merchant")
+        if not u or not m:
+            continue
+        users.add(u)
+        merchants.add(m)
+        flagged = bool(flagged_by_id.get(t.get("transaction_id")))
+        key = (u, m)
+        e = edges.setdefault(key, {"count": 0, "flagged": False})
+        e["count"] += 1
+        e["flagged"] = e["flagged"] or flagged
+        merch_users.setdefault(m, set()).add(u)
+        if flagged:
+            merch_flagged.setdefault(m, set()).add(u)
+
+    # Anneaux : commerçant compromis touchant >= 2 clients distincts.
+    rings = []
+    for m, fusers in merch_flagged.items():
+        if len(fusers) >= 2:
+            rings.append({
+                "merchant": m,
+                "users": sorted(fusers),
+                "n_users": len(fusers),
+            })
+    rings.sort(key=lambda r: r["n_users"], reverse=True)
+    ring_merchants = {r["merchant"] for r in rings}
+
+    flagged_users = {u for (u, m), e in edges.items() if e["flagged"]}
+
+    nodes = []
+    for u in sorted(users):
+        nodes.append({"id": u, "type": "user", "flagged": u in flagged_users})
+    for m in sorted(merchants):
+        nodes.append({"id": m, "type": "merchant",
+                      "flagged": m in merch_flagged, "ring": m in ring_merchants})
+
+    edge_list = [{"user": u, "merchant": m, "count": e["count"],
+                  "flagged": e["flagged"]} for (u, m), e in edges.items()]
+
+    return {"nodes": nodes, "edges": edge_list, "rings": rings}
+
+
+# --------------------------------------------------------------------------- #
+#  Prédiction : propension de fraude par client (scorecard explicable)        #
+#                                                                             #
+#  Sans étiquettes « fraude avérée » on ne peut pas entraîner un modèle        #
+#  supervisé : on utilise un SCORECARD pondéré (comme le scoring de crédit),   #
+#  transparent et auditable, qui anticipe quel client risque de basculer.     #
+#  Fonction séparée : n'affecte pas `detect_fraud`.                           #
+# --------------------------------------------------------------------------- #
+FORECAST_WEIGHTS = {
+    "Taux d'alertes": 0.45,        # part de transactions déjà signalées
+    "Volatilité des montants": 0.15,
+    "Dispersion géographique": 0.15,
+    "Paiements sans carte": 0.15,
+    "Activité nocturne": 0.10,
+}
+
+
+def forecast_client_risk(transactions):
+    """Prédit une propension de fraude (0–1) par client, avec ses facteurs.
+
+    Renvoie {user_id: {"score", "level", "drivers": [(facteur, contribution)]}}.
+    """
+    try:
+        txs = list(transactions)
+    except TypeError:
+        return {}
+
+    safe = [t if isinstance(t, dict) else {} for t in txs]
+    verdicts = detect_fraud(safe)
+    flagged_by_id = {v["transaction_id"]: v["is_suspicious"] for v in verdicts}
+    times = [_parse_time(t.get("timestamp")) for t in safe]
+    groups = _group_by_user(safe)
+
+    out = {}
+    for uid, idxs in groups.items():
+        n = len(idxs)
+        amounts = [safe[i].get("amount") for i in idxs
+                   if isinstance(safe[i].get("amount"), (int, float))
+                   and safe[i].get("amount") > 0]
+        n_flagged = sum(1 for i in idxs
+                        if flagged_by_id.get(safe[i].get("transaction_id")))
+        countries = {safe[i].get("country") for i in idxs if safe[i].get("country")}
+        n_cnp = sum(1 for i in idxs if safe[i].get("card_present") is False)
+        n_night = sum(1 for i in idxs
+                      if times[i] is not None and 0 <= times[i].hour <= 5)
+
+        med = _median(amounts) if amounts else 0
+        mad = _median([abs(a - med) for a in amounts]) if amounts else 0
+        volatility = min(1.0, (mad / med)) if med else 0.0
+
+        feats = {
+            "Taux d'alertes": (n_flagged / n) if n else 0.0,
+            "Volatilité des montants": volatility,
+            "Dispersion géographique": min(1.0, (len(countries) - 1) / 2.0) if countries else 0.0,
+            "Paiements sans carte": (n_cnp / n) if n else 0.0,
+            "Activité nocturne": (n_night / n) if n else 0.0,
+        }
+        score = sum(FORECAST_WEIGHTS[k] * v for k, v in feats.items())
+        score = round(min(1.0, max(0.0, score)), 3)
+
+        if score >= 0.5:
+            level = "Forte"
+        elif score >= 0.25:
+            level = "Modérée"
+        else:
+            level = "Faible"
+
+        drivers = sorted(
+            ((k, round(FORECAST_WEIGHTS[k] * v, 3)) for k, v in feats.items()),
+            key=lambda kv: kv[1], reverse=True)
+
+        out[uid] = {"user_id": uid, "score": score, "level": level,
+                    "drivers": [d for d in drivers if d[1] > 0]}
+    return out
