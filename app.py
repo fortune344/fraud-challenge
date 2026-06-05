@@ -22,9 +22,15 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from fraud_detection import (_clean_row, build_user_profiles,
+from fraud_detection import (_clean_row, _COUNTRY_COORDS, build_user_profiles,
                              detect_fraud, forecast_client_risk,
                              geo_anomalies, load_transactions)
+
+try:
+    import pydeck as pdk
+    _HAS_PYDECK = True
+except Exception:
+    _HAS_PYDECK = False
 
 # CSV de démonstration : le fichier officiel du dépôt (data/sample_transactions.csv).
 _DATA_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -317,27 +323,61 @@ def _risk_rows(view):
     return f'<div class="nb-card">{"".join(out)}</div>'
 
 
-def _geo_rows(anomalies):
-    """Cartes détaillées des voyages impossibles (distance, temps)."""
-    if not anomalies:
-        return ('<div class="nb-card"><div class="nb-row"><div class="nb-reason">'
-                'Aucun voyage impossible détecté sur ce lot.</div></div></div>')
-    out = []
-    for a in anomalies:
-        elapsed = a["hours_elapsed"]
-        el_txt = (f'{int(elapsed*60)} min' if elapsed < 1 else f'{elapsed:.1f} h')
-        out.append(
-            f'<div class="nb-geo">'
-            f'<div class="nb-geo-route">{a["from"]} <span style="color:{CRIT_C}">→</span> {a["to"]}</div>'
-            f'<div class="nb-geo-meta">'
-            f'<b>{a["user_id"]}</b> · {a["tx_ids"][0]} → {a["tx_ids"][1]}<br>'
-            f'<span class="k">{_fmt(a["distance_km"])} km</span> à parcourir · '
-            f'<span class="k">{a["hours_needed"]:.1f} h</span> nécessaires en avion · '
-            f'seulement <span class="k" style="color:{CRIT_C}">{el_txt}</span> écoulées'
-            f'</div>'
-            f'<div class="nb-chip" style="background:{CRIT_C};color:#fff">IMPOSSIBLE</div>'
-            f'</div>')
-    return f'<div class="nb-card">{"".join(out)}</div>'
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+
+
+def _map_deck(df, geo):
+    """Carte interactive : transactions positionnées par pays, arcs des voyages impossibles."""
+    pts, seen = [], {}
+    for _, r in df.iterrows():
+        c = r["country"]
+        coord = _COUNTRY_COORDS.get(str(c).upper()) if c else None
+        if not coord:
+            continue
+        idx = seen.get(c, 0)
+        seen[c] = idx + 1
+        lat = coord[0] + ((idx % 3) - 1) * 0.9 + (idx // 3) * 0.5
+        lon = coord[1] + (((idx + 1) % 3) - 1) * 1.1 + (idx // 3) * 0.3
+        amt = r["amount"] if isinstance(r["amount"], (int, float)) else 0
+        pts.append({
+            "lat": round(lat, 3), "lon": round(lon, 3),
+            "color": _hex_rgb(RISK_COLOR[r["risk"]]) + [220],
+            "radius": 45000 + (abs(amt) ** 0.5) * 5000,
+            "tid": r["transaction_id"], "merchant": r["merchant"] or "—",
+            "amount": (f'{_fmt(r["amount"])} {r["currency"] or ""}'
+                       if r["amount"] is not None else "—"),
+            "country": c or "—", "risk": r["risk"], "reason": r["reason"] or "—",
+        })
+    arcs = []
+    for a in geo:
+        s = _COUNTRY_COORDS.get(a["from"].upper())
+        t = _COUNTRY_COORDS.get(a["to"].upper())
+        if s and t:
+            arcs.append({"slat": s[0], "slon": s[1], "tlat": t[0], "tlon": t[1]})
+
+    layers = []
+    if arcs:
+        layers.append(pdk.Layer(
+            "ArcLayer", data=arcs,
+            get_source_position="[slon, slat]", get_target_position="[tlon, tlat]",
+            get_source_color=[255, 46, 46], get_target_color=[255, 140, 0],
+            get_width=4, get_tilt=15))
+    layers.append(pdk.Layer(
+        "ScatterplotLayer", data=pts,
+        get_position="[lon, lat]", get_fill_color="color", get_radius="radius",
+        radius_min_pixels=7, radius_max_pixels=46, stroked=True,
+        get_line_color=[17, 17, 17], line_width_min_pixels=2, opacity=0.85,
+        pickable=True))
+
+    view = pdk.ViewState(latitude=28, longitude=20, zoom=1.0, pitch=35)
+    tooltip = {"html": "<b>{tid}</b> — {merchant}<br/>{amount} · {country} · "
+                       "<b>{risk}</b><br/>{reason}",
+               "style": {"backgroundColor": "#111", "color": "#D9FF00",
+                         "fontFamily": "monospace", "fontSize": "11px"}}
+    return pdk.Deck(layers=layers, initial_view_state=view,
+                    map_provider="carto", map_style="light", tooltip=tooltip)
 
 
 def _forecast_rows(forecast):
@@ -527,67 +567,73 @@ def render_interface():
     k[3].markdown(_kpi("Score moyen", f"{score_moyen:.2f}", "", 0.24, 0.6),
                   unsafe_allow_html=True)
 
-    # Menaces
-    st.markdown('<div class="nb-sec">Menaces détectées</div>', unsafe_allow_html=True)
-    if len(view):
-        st.markdown(_risk_rows(view), unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="nb-card"><div class="nb-row"><div class="nb-reason">'
-                    'Aucune transaction sur ce filtre.</div></div></div>',
-                    unsafe_allow_html=True)
-
-    # Pourquoi ?
-    if len(alerts):
+    # ===== Rangée : Menaces | Pourquoi ===== #
+    cm, cw = st.columns(2, gap="medium")
+    with cm:
+        st.markdown('<div class="nb-sec">Menaces détectées</div>', unsafe_allow_html=True)
+        if len(view):
+            st.markdown(_risk_rows(view), unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="nb-card"><div class="nb-row"><div class="nb-reason">'
+                        'Aucune transaction sur ce filtre.</div></div></div>',
+                        unsafe_allow_html=True)
+    with cw:
         st.markdown('<div class="nb-sec">Pourquoi&nbsp;?</div>', unsafe_allow_html=True)
-        items = []
-        for _, r in alerts.iterrows():
-            color = RISK_COLOR[r["risk"]]
-            items.append(
-                f'<div class="nb-exp"><div class="h" style="color:{color}">'
-                f'▮ {r["transaction_id"]} · {r["user_id"]} · {r["risk"].upper()}</div>'
-                f'<div class="b">{_enriched_explanation(r, profiles.get(r["user_id"]))}</div></div>')
-        st.markdown(f'<div class="nb-card">{"".join(items)}</div>', unsafe_allow_html=True)
+        if len(alerts):
+            items = []
+            for _, r in alerts.iterrows():
+                color = RISK_COLOR[r["risk"]]
+                items.append(
+                    f'<div class="nb-exp"><div class="h" style="color:{color}">'
+                    f'▮ {r["transaction_id"]} · {r["user_id"]} · {r["risk"].upper()}</div>'
+                    f'<div class="b">{_enriched_explanation(r, profiles.get(r["user_id"]))}</div></div>')
+            st.markdown(f'<div class="nb-card">{"".join(items)}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="nb-card"><div class="nb-row"><div class="nb-reason">'
+                        'Aucune alerte.</div></div></div>', unsafe_allow_html=True)
 
-    # Analyse géographique — voyage impossible
-    st.markdown('<div class="nb-sec">Voyage impossible</div>', unsafe_allow_html=True)
-    st.markdown(_geo_rows(geo), unsafe_allow_html=True)
-    st.caption("Cohérence géographique : distance réelle (haversine) rapportée au "
-               "temps écoulé. Un trajet plus rapide qu'un avion = physiquement impossible.")
+    # ===== CARTE (pleine largeur) ===== #
+    st.markdown('<div class="nb-sec">Carte des transactions</div>', unsafe_allow_html=True)
+    if _HAS_PYDECK:
+        try:
+            st.pydeck_chart(_map_deck(df, geo), use_container_width=True)
+        except Exception:
+            st.map(df.dropna(subset=["country"]).assign(
+                lat=df["country"].map(lambda c: (_COUNTRY_COORDS.get(str(c).upper()) or (None, None))[0]),
+                lon=df["country"].map(lambda c: (_COUNTRY_COORDS.get(str(c).upper()) or (None, None))[1]))
+                .dropna(subset=["lat", "lon"])[["lat", "lon"]])
+    else:
+        st.info("Carte indisponible (pydeck non installé).")
+    st.caption("● rouge = critique · ● orange = élevé · ● jaune = moyen · ● vert = faible "
+               "· la taille du point ∝ montant · arc rouge→orange = voyage impossible.")
 
-    # Prédiction
-    st.markdown('<div class="nb-sec">Prédiction · propension par client</div>',
-                unsafe_allow_html=True)
-    st.markdown(_forecast_rows(forecast), unsafe_allow_html=True)
-    st.caption("Scorecard explicable (sans étiquettes de fraude) : anticipe quel "
-               "client risque de basculer, à partir de son comportement.")
-
-    # Analyse (graphiques)
-    st.markdown('<div class="nb-sec">Analyse</div>', unsafe_allow_html=True)
-    g1, g2 = st.columns(2, gap="medium")
-    with g1:
-        st.markdown("**RÉPARTITION DU RISQUE**")
+    # ===== Rangée : Prédiction | Graphiques ===== #
+    cp, cg = st.columns(2, gap="medium")
+    with cp:
+        st.markdown('<div class="nb-sec">Prédiction</div>', unsafe_allow_html=True)
+        st.markdown(_forecast_rows(forecast), unsafe_allow_html=True)
+        st.caption("Scorecard explicable : anticipe quel client risque de basculer, "
+                   "d'après son comportement.")
+    with cg:
+        st.markdown('<div class="nb-sec">Analyse</div>', unsafe_allow_html=True)
         rep = (df["risk"].value_counts().reindex(RISK_ORDER).fillna(0).reset_index())
         rep.columns = ["Niveau", "Nombre"]
-        donut = (alt.Chart(rep).mark_arc(innerRadius=58, stroke=INK, strokeWidth=2.5).encode(
+        donut = (alt.Chart(rep).mark_arc(innerRadius=50, stroke=INK, strokeWidth=2.5).encode(
             theta="Nombre:Q",
             color=alt.Color("Niveau:N",
                             scale=alt.Scale(domain=RISK_ORDER,
                                             range=[CRIT_C, HIGH_C, MED_C, LOW_C]),
                             legend=alt.Legend(orient="bottom", title=None)),
-            tooltip=["Niveau", "Nombre"]).properties(height=250))
+            tooltip=["Niveau", "Nombre"]).properties(height=180))
         st.altair_chart(_nb_chart(donut), use_container_width=True)
-    with g2:
-        st.markdown("**MOTIFS DES ALERTES**")
         if len(alerts):
             motifs = alerts["reason"].value_counts().reset_index()
             motifs.columns = ["Motif", "Nombre"]
             bar = (alt.Chart(motifs).mark_bar(color=ACID, stroke=INK, strokeWidth=2.5).encode(
                 x=alt.X("Nombre:Q", axis=alt.Axis(tickMinStep=1)),
                 y=alt.Y("Motif:N", sort="-x", title=None),
-                tooltip=["Motif", "Nombre"]).properties(height=250))
+                tooltip=["Motif", "Nombre"]).properties(height=170))
             st.altair_chart(_nb_chart(bar), use_container_width=True)
-        else:
-            st.success("Aucune alerte.")
 
     # Rapport
     st.markdown('<div class="nb-sec">Rapport</div>', unsafe_allow_html=True)
