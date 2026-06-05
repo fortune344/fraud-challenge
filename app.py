@@ -15,24 +15,30 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from fraud_detection import _clean_row, detect_fraud
+from fraud_detection import _clean_row, build_user_profiles, detect_fraud
 
 
 # --------------------------------------------------------------------------- #
 #  Palette & constantes                                                        #
 # --------------------------------------------------------------------------- #
-RISK_HIGH = 0.85
-RISK_MED = 0.5
-
 BG = "#0b0f1a"
 PANEL = "#131a2b"
 BORDER = "rgba(255,255,255,.07)"
 TEXT = "#e8eef9"
 MUTED = "#7d8aa6"
 ACCENT = "#5b8cff"
-DANGER = "#ff5470"
-WARN = "#ffae42"
-OK = "#2dd4a7"
+
+# Système à 4 niveaux de risque 🟢🟡🟠🔴
+CRIT_C = "#ff5470"   # Critique
+HIGH_C = "#ff8c42"   # Élevé
+MED_C = "#ffd43b"    # Moyen
+LOW_C = "#2dd4a7"    # Faible
+DANGER, WARN, OK = CRIT_C, HIGH_C, LOW_C  # alias pour graphiques
+
+RISK_ORDER = ["Critique", "Élevé", "Moyen", "Faible"]
+RISK_EMOJI = {"Critique": "🔴", "Élevé": "🟠", "Moyen": "🟡", "Faible": "🟢"}
+BADGE_BG = {CRIT_C: "rgba(255,84,112,.14)", HIGH_C: "rgba(255,140,66,.14)",
+            MED_C: "rgba(255,212,59,.14)", LOW_C: "rgba(45,212,167,.12)"}
 
 _EXEMPLE_CSV = """transaction_id,timestamp,user_id,amount,currency,merchant,country,card_present
 T-001,2025-05-02T09:15:00Z,U1,48.00,EUR,Boulangerie,FR,true
@@ -52,19 +58,23 @@ T-031,2025-06-06T08:00:00Z,U4,120.00,USD,Hotel,US,false
 #  Helpers de données                                                          #
 # --------------------------------------------------------------------------- #
 def _risk_level(score):
-    if score >= RISK_HIGH:
+    if score >= 0.85:
+        return "Critique"
+    if score >= 0.70:
         return "Élevé"
-    if score >= RISK_MED:
-        return "Modéré"
+    if score >= 0.50:
+        return "Moyen"
     return "Faible"
 
 
 def _risk_color(score):
-    if score >= RISK_HIGH:
-        return DANGER
-    if score >= RISK_MED:
-        return WARN
-    return OK
+    if score >= 0.85:
+        return CRIT_C
+    if score >= 0.70:
+        return HIGH_C
+    if score >= 0.50:
+        return MED_C
+    return LOW_C
 
 
 def _rows_from_csv_text(text):
@@ -97,6 +107,46 @@ def _build_dataframe(transactions, results):
 
 def _fmt(n):
     return f"{n:,.0f}".replace(",", " ")
+
+
+def _enriched_explanation(row, profile):
+    """Explication détaillée et lisible d'une alerte, à partir du profil client.
+
+    Exemple : « Montant très supérieur à l'habitude du client — montant 12×
+    supérieur à l'habitude (~50 EUR), pays « JP » inhabituel pour ce client. »
+    Le verdict reste celui du moteur ; on l'enrichit pour la transparence.
+    """
+    reason = row["reason"] or ""
+    amount = row["amount"]
+    cur = row["currency"] or ""
+    parts = []
+
+    if "très supérieur" in reason and profile and profile.get("median_amount"):
+        med = profile["median_amount"]
+        if med and isinstance(amount, (int, float)):
+            parts.append(f"montant {amount / med:.0f}× supérieur à l'habitude "
+                         f"(~{_fmt(med)} {cur})")
+    if "Deux pays" in reason:
+        parts.append("déplacement géographiquement impossible dans le temps écoulé")
+    if "nul ou négatif" in reason:
+        parts.append("montant invalide (≤ 0)")
+    if "manquants" in reason:
+        champ = reason.split(":", 1)[1].strip() if ":" in reason else "information"
+        parts.append(f"{champ} absent(e)")
+    if "Fréquence" in reason:
+        parts.append("rafale de transactions en très peu de temps")
+    if "double" in reason:
+        parts.append("débit identique répété")
+
+    # Contexte (pas une alerte en soi) : pays rarement/jamais vu pour ce client.
+    if profile and row["country"] and profile.get("countries"):
+        seen = profile["countries"].get(row["country"], 0)
+        if seen <= 1 and len(profile["countries"]) > 1 and row["is_suspicious"]:
+            parts.append(f"pays « {row['country']} » inhabituel pour ce client")
+
+    if not parts:
+        return reason
+    return f"{reason} — " + ", ".join(parts) + "."
 
 
 # --------------------------------------------------------------------------- #
@@ -194,8 +244,7 @@ def _risk_rows_html(df_view):
         score = float(r["fraud_score"])
         color = _risk_color(score)
         width = max(score * 100, 2)
-        badge_bg = {DANGER: "rgba(255,84,112,.14)", WARN: "rgba(255,174,66,.14)",
-                    OK: "rgba(45,212,167,.12)"}[color]
+        badge_bg = BADGE_BG[color]
         rows.append(
             f'<div class="rad-row">'
             f'<div class="id">{r["transaction_id"]}</div>'
@@ -250,12 +299,12 @@ def render_interface():
 
     results = detect_fraud(transactions)
     df = _build_dataframe(transactions, results)
+    profiles = build_user_profiles(transactions)
 
     # ---- Filtres ---------------------------------------------------------- #
     with st.sidebar:
         st.markdown("### Filtres")
-        niveaux = st.multiselect("Niveau de risque", ["Élevé", "Modéré", "Faible"],
-                                 default=["Élevé", "Modéré", "Faible"])
+        niveaux = st.multiselect("Niveau de risque", RISK_ORDER, default=RISK_ORDER)
         users = sorted(u for u in df["user_id"].dropna().unique())
         users_sel = st.multiselect("Client", users, default=users)
         only_susp = st.toggle("Seulement les suspectes", value=False)
@@ -277,7 +326,7 @@ def render_interface():
     st.markdown(
         f"""
         <div class="rad-top">
-          <div class="rad-brand">🛡️ Anti-Fraude<span>Radar de transactions · LBS 2026</span></div>
+          <div class="rad-brand">🛡️ Anti-Fraude<span>Profil comportemental · 4 niveaux de risque · LBS 2026</span></div>
           <div class="rad-live">
             <span><span class="rad-dot"></span>Analyse en direct</span>
             <span class="rad-pill">{flagged}/{total} alertes</span>
@@ -311,13 +360,32 @@ def render_interface():
         d.markdown(_metric_html("Score moyen", f"{score_moyen:.2f}"), unsafe_allow_html=True)
 
     # ---- Risque par transaction ------------------------------------------ #
-    st.markdown('<div class="rad-sec">Risque par transaction</div>',
+    st.markdown('<div class="rad-sec">Risque par transaction · 4 niveaux 🟢🟡🟠🔴</div>',
                 unsafe_allow_html=True)
     if len(view):
         st.markdown(f'<div class="rad-card" style="padding:10px 20px">'
                     f'{_risk_rows_html(view)}</div>', unsafe_allow_html=True)
     else:
         st.info("Aucune transaction sur ce périmètre de filtres.")
+
+    # ---- Explications détaillées (explicabilité) -------------------------- #
+    alerts = view[view["is_suspicious"]].sort_values("fraud_score", ascending=False)
+    if len(alerts):
+        st.markdown('<div class="rad-sec">Pourquoi ces alertes ?</div>',
+                    unsafe_allow_html=True)
+        items = []
+        for _, r in alerts.iterrows():
+            color = _risk_color(float(r["fraud_score"]))
+            lvl = r["risk"]
+            txt = _enriched_explanation(r, profiles.get(r["user_id"]))
+            items.append(
+                f'<div style="padding:10px 2px;border-bottom:1px solid rgba(255,255,255,.04)">'
+                f'<span style="color:{color};font-weight:700">{RISK_EMOJI[lvl]} {lvl}</span>'
+                f'<span style="color:{MUTED}"> · {r["transaction_id"]} · '
+                f'{r["merchant"] or "—"} · {r["user_id"]}</span><br>'
+                f'<span style="color:{TEXT};font-size:13.5px">{txt}</span></div>')
+        st.markdown(f'<div class="rad-card" style="padding:6px 20px">'
+                    f'{"".join(items)}</div>', unsafe_allow_html=True)
 
     # ---- Graphiques ------------------------------------------------------- #
     st.markdown('<div class="rad-sec">Analyse</div>', unsafe_allow_html=True)
@@ -326,13 +394,13 @@ def render_interface():
     with g1:
         st.caption("Répartition par niveau de risque")
         rep = (df["risk"].value_counts()
-               .reindex(["Élevé", "Modéré", "Faible"]).fillna(0).reset_index())
+               .reindex(RISK_ORDER).fillna(0).reset_index())
         rep.columns = ["Niveau", "Nombre"]
         donut = (alt.Chart(rep).mark_arc(innerRadius=62, cornerRadius=3).encode(
             theta="Nombre:Q",
             color=alt.Color("Niveau:N",
-                            scale=alt.Scale(domain=["Élevé", "Modéré", "Faible"],
-                                            range=[DANGER, WARN, OK]),
+                            scale=alt.Scale(domain=RISK_ORDER,
+                                            range=[CRIT_C, HIGH_C, MED_C, LOW_C]),
                             legend=alt.Legend(orient="bottom", title=None)),
             tooltip=["Niveau", "Nombre"]).properties(height=240))
         st.altair_chart(_dark_chart(donut), use_container_width=True)
@@ -350,6 +418,26 @@ def render_interface():
             st.altair_chart(_dark_chart(bar), use_container_width=True)
         else:
             st.success("Aucune alerte sur ce périmètre.")
+
+    # ---- Profils comportementaux ------------------------------------------ #
+    with st.expander("Profils comportementaux des clients"):
+        prof_rows = []
+        for uid in sorted(profiles):
+            p = profiles[uid]
+            prof_rows.append({
+                "Client": uid,
+                "Transactions": p["n_transactions"],
+                "Montant moyen": (f'{_fmt(p["avg_amount"])}' if p["avg_amount"] else "—"),
+                "Montant médian": (f'{_fmt(p["median_amount"])}' if p["median_amount"] else "—"),
+                "Pays habituel": p["main_country"] or "—",
+                "Commerçant habituel": p["main_merchant"] or "—",
+                "Pays fréquentés": ", ".join(p["countries"].keys()) or "—",
+                "Intervalle médian (h)": p["median_interval_h"] if p["median_interval_h"] is not None else "—",
+            })
+        st.dataframe(pd.DataFrame(prof_rows), use_container_width=True, hide_index=True)
+        st.caption("Le profil de chaque client (montant habituel, fréquence, pays "
+                   "et commerçants fréquentés) sert de référence : une fraude se "
+                   "distingue d'un simple changement de comportement.")
 
     # ---- Table & export --------------------------------------------------- #
     with st.expander("Table détaillée & export"):

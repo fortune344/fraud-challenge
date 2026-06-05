@@ -422,3 +422,59 @@ def _evaluate_one(i, tx, travel_flags, freq_flags, dup_flags, amount_history):
 
     # --- Niveau 3 : rien d'anormal ----------------------------------------- #
     return verdict(SCORE_CLEAN, "Transaction conforme au profil du client")
+
+
+# --------------------------------------------------------------------------- #
+#  Profil comportemental par client (utilitaire)                              #
+#                                                                             #
+#  Fonction SÉPARÉE : elle n'affecte en rien `detect_fraud`. Elle synthétise  #
+#  l'historique de chaque client (montant habituel, fréquence, pays et        #
+#  commerçants fréquentés) pour le dashboard et l'explicabilité.              #
+# --------------------------------------------------------------------------- #
+def build_user_profiles(transactions):
+    """Construit un profil comportemental pour chaque client.
+
+    Renvoie un dict {user_id: profil} où profil contient le nombre de
+    transactions, le montant moyen/médian, l'intervalle médian entre achats,
+    et la fréquentation des pays et commerçants.
+    """
+    try:
+        txs = list(transactions)
+    except TypeError:
+        return {}
+
+    safe = [t if isinstance(t, dict) else {} for t in txs]
+    times = [_parse_time(t.get("timestamp")) for t in safe]
+    groups = _group_by_user(safe)
+
+    profiles = {}
+    for uid, idxs in groups.items():
+        amounts = [safe[i].get("amount") for i in idxs
+                   if isinstance(safe[i].get("amount"), (int, float))
+                   and safe[i].get("amount") > 0]
+
+        countries, merchants = {}, {}
+        for i in idxs:
+            c = safe[i].get("country")
+            if c:
+                countries[c] = countries.get(c, 0) + 1
+            m = safe[i].get("merchant")
+            if m:
+                merchants[m] = merchants.get(m, 0) + 1
+
+        ordered = sorted(times[i] for i in idxs if times[i] is not None)
+        intervals = [(ordered[k + 1] - ordered[k]).total_seconds() / 3600.0
+                     for k in range(len(ordered) - 1)]
+
+        profiles[uid] = {
+            "user_id": uid,
+            "n_transactions": len(idxs),
+            "avg_amount": round(sum(amounts) / len(amounts), 2) if amounts else None,
+            "median_amount": _median(amounts) if amounts else None,
+            "countries": countries,
+            "merchants": merchants,
+            "main_country": max(countries, key=countries.get) if countries else None,
+            "main_merchant": max(merchants, key=merchants.get) if merchants else None,
+            "median_interval_h": round(_median(intervals), 1) if intervals else None,
+        }
+    return profiles
